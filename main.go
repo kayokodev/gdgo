@@ -11,8 +11,10 @@ import (
 	"fmt"
 	"math"
 	"net/http"
+	"net/url"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -279,6 +281,7 @@ type Trade struct {
 }
 
 type Engine struct {
+	Notify  func(string) // optional alert hook (Telegram)
 	P       Params
 	Cash    float64
 	Pos     *Position
@@ -296,6 +299,12 @@ func (e *Engine) equity(px float64) float64 {
 	return e.Cash
 }
 
+func (e *Engine) notify(f string, a ...interface{}) {
+	if e.Notify != nil {
+		e.Notify(fmt.Sprintf(f, a...))
+	}
+}
+
 func (e *Engine) logf(f string, a ...interface{}) {
 	if e.Logf != nil {
 		e.Logf(f, a...)
@@ -311,6 +320,7 @@ func (e *Engine) closePos(c Candle, px float64, why string) {
 	t := Trade{pos.Open, c.Time, pos.Entry, px, pos.Qty, pnl, why}
 	e.Trades = append(e.Trades, t)
 	e.logf("EXIT  %s @ %.2f  pnl %+.2f USDT", why, px, pnl)
+	e.notify("🔴 EXIT %s @ %.2f | pnl %+.2f USDT | cash %.2f", why, px, pnl, e.Cash)
 	if e.OnTrade != nil {
 		e.OnTrade(t)
 	}
@@ -349,6 +359,7 @@ func (e *Engine) Step(cs []Candle, ind Ind, i int) {
 					e.Cash -= qty * c.C * (1 + e.P.Fee)
 					e.Pos = &Position{HH: c.C, Qty: qty, Entry: c.C, Stop: c.C - stopDist, TP: c.C + e.P.TPATR*ind.A[i], Open: c.Time}
 					e.logf("ENTRY %s @ %.2f  qty %.5f  SL %.2f  TP %.2f", why, c.C, qty, e.Pos.Stop, e.Pos.TP)
+					e.notify("🟢 ENTRY %s @ %.2f | qty %.5f | SL %.2f | TP %.2f", why, c.C, qty, e.Pos.Stop, e.Pos.TP)
 				}
 			}
 		}
@@ -427,11 +438,66 @@ func backtest(p Params, symbol, interval string, cash float64, n int) {
 	baseline(cs, ind, p.Trend, cash, p.Fee)
 }
 
-func paper(p Params, symbol, interval string, cash float64, poll time.Duration) {
+// ---------- state + alerts ----------
+
+type State struct {
+	Cash  float64   `json:"cash"`
+	Pos   *Position `json:"pos"`
+	Peak  float64   `json:"peak"`
+	MaxDD float64   `json:"max_dd"`
+	Last  time.Time `json:"last"`
+}
+
+func saveState(path string, e *Engine, last time.Time) error {
+	b, err := json.MarshalIndent(State{e.Cash, e.Pos, e.Peak, e.MaxDD, last}, "", "  ")
+	if err != nil {
+		return err
+	}
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, b, 0600); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path) // atomic swap so a crash can't corrupt the file
+}
+
+func loadState(path string) (*State, error) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	var st State
+	if err := json.Unmarshal(b, &st); err != nil {
+		return nil, err
+	}
+	return &st, nil
+}
+
+// telegram sends a message if TG_TOKEN and TG_CHAT env vars are set (no-op otherwise).
+func telegram(msg string) {
+	token, chat := os.Getenv("TG_TOKEN"), os.Getenv("TG_CHAT")
+	if token == "" || chat == "" {
+		return
+	}
+	resp, err := (&http.Client{Timeout: 10 * time.Second}).PostForm(
+		"https://api.telegram.org/bot"+token+"/sendMessage",
+		url.Values{"chat_id": {chat}, "text": {msg}})
+	if err != nil {
+		// scrub the token: Go error text includes the full URL
+		fmt.Println("telegram send failed:", strings.ReplaceAll(err.Error(), token, "***"))
+		return
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		fmt.Println("telegram send failed: http", resp.StatusCode)
+	}
+}
+
+func paper(p Params, symbol, interval string, cash float64, poll time.Duration, statePath string, reset, heartbeat bool) {
 	e := &Engine{P: p, Cash: cash, Peak: cash}
 	e.Logf = func(f string, a ...interface{}) {
 		fmt.Printf("[%s] "+f+"\n", append([]interface{}{time.Now().Format("01-02 15:04:05")}, a...)...)
 	}
+	e.Notify = telegram
 	f, err := os.OpenFile("trades.csv", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
 		fmt.Println("cant open trades.csv:", err)
@@ -444,23 +510,58 @@ func paper(p Params, symbol, interval string, cash float64, poll time.Duration) 
 			fmt.Sprintf("%.5f", t.Qty), fmt.Sprintf("%.2f", t.PnL), t.Why})
 		w.Flush()
 	}
+
 	var last time.Time
+	if reset {
+		os.Remove(statePath)
+	}
+	if st, lerr := loadState(statePath); lerr == nil {
+		e.Cash, e.Pos, e.Peak, e.MaxDD, last = st.Cash, st.Pos, st.Peak, st.MaxDD, st.Last
+		e.logf("resumed from %s | cash %.2f | position open: %v | last candle %s",
+			statePath, e.Cash, e.Pos != nil, last.Format("01-02 15:04"))
+		e.notify("🔄 goldbot resumed | cash %.2f | position open: %v", e.Cash, e.Pos != nil)
+	} else if !os.IsNotExist(lerr) {
+		e.logf("could not read %s (%v), starting fresh", statePath, lerr)
+	}
+
+	fails := 0
 	for {
-		cs, err := fetchCandles(symbol, interval, 500, 0)
+		cs, err := fetchCandles(symbol, interval, 1000, 0)
 		if err != nil || len(cs) < p.Trend+10 {
+			fails++
 			e.logf("fetch error: %v", err)
+			if fails == 10 {
+				e.notify("⚠️ goldbot: 10 failed fetches in a row, still retrying")
+			}
 			time.Sleep(poll)
 			continue
 		}
+		fails = 0
 		cs = cs[:len(cs)-1] // drop the still-forming candle
-		i := len(cs) - 1
 		if last.IsZero() {
-			last = cs[i].Time
-			e.logf("watching %s %s | last close %.2f | cash %.2f", symbol, interval, cs[i].C, e.Cash)
-		} else if cs[i].Time.After(last) {
-			last = cs[i].Time
-			e.Step(cs, calc(cs, p), i)
-			e.logf("candle close %.2f | equity %.2f | maxDD %.2f%%", cs[i].C, e.equity(cs[i].C), e.MaxDD*100)
+			last = cs[len(cs)-1].Time
+			if err := saveState(statePath, e, last); err != nil {
+				e.logf("state save failed: %v", err)
+			}
+			e.logf("watching %s %s | last close %.2f | cash %.2f", symbol, interval, cs[len(cs)-1].C, e.Cash)
+			e.notify("🥇 goldbot started | %s %s | cash %.2f | last close %.2f", symbol, interval, e.Cash, cs[len(cs)-1].C)
+		} else {
+			ind := calc(cs, p)
+			for i := range cs { // catches up on any candles missed while the bot was down
+				if !cs[i].Time.After(last) {
+					continue
+				}
+				e.Step(cs, ind, i)
+				last = cs[i].Time
+				e.logf("candle close %.2f | equity %.2f | maxDD %.2f%%", cs[i].C, e.equity(cs[i].C), e.MaxDD*100)
+				if heartbeat {
+					e.notify("📊 close %.2f | equity %.2f | maxDD %.2f%% | position open: %v",
+						cs[i].C, e.equity(cs[i].C), e.MaxDD*100, e.Pos != nil)
+				}
+				if err := saveState(statePath, e, last); err != nil {
+					e.logf("state save failed: %v", err)
+				}
+			}
 		}
 		time.Sleep(poll)
 	}
@@ -477,6 +578,9 @@ func main() {
 	flag.Float64Var(&p.RiskPct, "risk", p.RiskPct, "equity fraction risked per trade (0.01 = 1%)")
 	flag.Float64Var(&p.StopATR, "sl", p.StopATR, "stop distance in ATRs")
 	flag.Float64Var(&p.TPATR, "tp", p.TPATR, "take-profit distance in ATRs")
+	statePath := flag.String("state", "state.json", "paper mode: state file, lets the bot resume after a restart")
+	reset := flag.Bool("reset", false, "paper mode: delete saved state and start fresh")
+	heartbeat := flag.Bool("heartbeat", false, "paper mode: Telegram status on every closed candle")
 	flag.Float64Var(&p.Fee, "fee", p.Fee, "fee per side (0.001 = 0.1%; try 0.00075 with BNB discount)")
 	flag.Float64Var(&p.TrailATR, "trail", p.TrailATR, "trailing stop in ATRs (0 = off, uses fixed TP)")
 	flag.Float64Var(&p.ADXMin, "adx", p.ADXMin, "min ADX to enter, chop filter (0 = off)")
@@ -485,7 +589,7 @@ func main() {
 	flag.Parse()
 	switch *mode {
 	case "paper":
-		paper(p, *symbol, *interval, *cash, *poll)
+		paper(p, *symbol, *interval, *cash, *poll, *statePath, *reset, *heartbeat)
 	default:
 		backtest(p, *symbol, *interval, *cash, *candles)
 	}
