@@ -320,7 +320,13 @@ func (e *Engine) closePos(c Candle, px float64, why string) {
 	t := Trade{pos.Open, c.Time, pos.Entry, px, pos.Qty, pnl, why}
 	e.Trades = append(e.Trades, t)
 	e.logf("EXIT  %s @ %.2f  pnl %+.2f USDT", why, px, pnl)
-	e.notify("🔴 EXIT %s @ %.2f | pnl %+.2f USDT | cash %.2f", why, px, pnl, e.Cash)
+	msg := ""
+	if pnl > 0 {
+		msg = fmt.Sprintf("✅ *we're out with a W* — %s\n\nin @ %.2f out @ %.2f\n\n*+%.2f USDT* 💰\ncash now: %.2f\n\nnice execution bro 🔥", why, pos.Entry, px, pnl, e.Cash)
+	} else {
+		msg = fmt.Sprintf("🔴 *took the L* — %s\n\nin @ %.2f out @ %.2f\n\n%.2f USDT down\ncash: %.2f\n\nit's part of the game, we move 💪", why, pos.Entry, px, pnl, e.Cash)
+	}
+	e.notify(msg)
 	if e.OnTrade != nil {
 		e.OnTrade(t)
 	}
@@ -359,7 +365,7 @@ func (e *Engine) Step(cs []Candle, ind Ind, i int) {
 					e.Cash -= qty * c.C * (1 + e.P.Fee)
 					e.Pos = &Position{HH: c.C, Qty: qty, Entry: c.C, Stop: c.C - stopDist, TP: c.C + e.P.TPATR*ind.A[i], Open: c.Time}
 					e.logf("ENTRY %s @ %.2f  qty %.5f  SL %.2f  TP %.2f", why, c.C, qty, e.Pos.Stop, e.Pos.TP)
-					e.notify("🟢 ENTRY %s @ %.2f | qty %.5f | SL %.2f | TP %.2f", why, c.C, qty, e.Pos.Stop, e.Pos.TP)
+					e.notify(fmt.Sprintf("🟢 *ENTRY* — just went long on %s\n\ngold @ *%.2f* 🥇\nyou're in: %.5f PAXG\n\n*watch these levels:*\n📍 Stop: %.2f (don't go past this)\n🎯 Target: %.2f (take profit here)\n\nrisk: %.2f%% of your cash\n\nlet's ride this one bro 🚀", why, c.C, qty, e.Pos.Stop, e.Pos.TP, e.P.RiskPct*100))
 				}
 			}
 		}
@@ -509,6 +515,15 @@ func paper(p Params, symbol, interval string, cash float64, poll time.Duration, 
 			fmt.Sprintf("%.2f", t.Entry), fmt.Sprintf("%.2f", t.Exit),
 			fmt.Sprintf("%.5f", t.Qty), fmt.Sprintf("%.2f", t.PnL), t.Why})
 		w.Flush()
+		emoji := "🔴"
+		verdict := "took the L, moving on 💪"
+		mood := "stop hit, happens 🙏"
+		if t.PnL > 0 {
+			emoji = "✅"
+			verdict = "we're out with a W 🍾"
+			mood = "nice one bro 🚀"
+		}
+		e.notify(fmt.Sprintf("%s *closing this trade* — %s\n\n%s\n\n*Entered:* %.2f\n*Exited:* %.2f\n*Size:* %.5f\n\n💰 *Result: %+.2f USDT*\n\n%s", emoji, t.Why, verdict, t.Entry, t.Exit, t.Qty, t.PnL, mood))
 	}
 
 	var last time.Time
@@ -519,7 +534,11 @@ func paper(p Params, symbol, interval string, cash float64, poll time.Duration, 
 		e.Cash, e.Pos, e.Peak, e.MaxDD, last = st.Cash, st.Pos, st.Peak, st.MaxDD, st.Last
 		e.logf("resumed from %s | cash %.2f | position open: %v | last candle %s",
 			statePath, e.Cash, e.Pos != nil, last.Format("01-02 15:04"))
-		e.notify("🔄 goldbot resumed | cash %.2f | position open: %v", e.Cash, e.Pos != nil)
+		posStr := "waiting in cash for the next signal 📍"
+		if e.Pos != nil {
+			posStr = fmt.Sprintf("got an open position @ %.2f 💪", e.Pos.Entry)
+		}
+		e.notify(fmt.Sprintf("🔄 *i'm back online*\n\nyour cash: %.2f USDT\nposition: %s\nlast candle: %s\n\npicked up where i left off, still watching 👀", e.Cash, posStr, last.Format("01-02 15:04")))
 	} else if !os.IsNotExist(lerr) {
 		e.logf("could not read %s (%v), starting fresh", statePath, lerr)
 	}
@@ -531,7 +550,7 @@ func paper(p Params, symbol, interval string, cash float64, poll time.Duration, 
 			fails++
 			e.logf("fetch error: %v", err)
 			if fails == 10 {
-				e.notify("⚠️ goldbot: 10 failed fetches in a row, still retrying")
+				e.notify("⚠️ *yo, binance is being flakey*\n\n10 failed fetches in a row, but we're not giving up 💪\nstill retrying, should be back soon 🙏")
 			}
 			time.Sleep(poll)
 			continue
@@ -544,7 +563,7 @@ func paper(p Params, symbol, interval string, cash float64, poll time.Duration, 
 				e.logf("state save failed: %v", err)
 			}
 			e.logf("watching %s %s | last close %.2f | cash %.2f", symbol, interval, cs[len(cs)-1].C, e.Cash)
-			e.notify("🥇 goldbot started | %s %s | cash %.2f | last close %.2f", symbol, interval, e.Cash, cs[len(cs)-1].C)
+			e.notify(fmt.Sprintf("🥇 *yo, goldbot is running*\n\nscanning %s on %s candles\nyour cash: %.2f USDT\ngold rn: %.2f\n\ni'll watch for setups and ping you when i find one 👀 sit tight bro 🚀", symbol, interval, e.Cash, cs[len(cs)-1].C))
 		} else {
 			ind := calc(cs, p)
 			for i := range cs { // catches up on any candles missed while the bot was down
@@ -555,8 +574,12 @@ func paper(p Params, symbol, interval string, cash float64, poll time.Duration, 
 				last = cs[i].Time
 				e.logf("candle close %.2f | equity %.2f | maxDD %.2f%%", cs[i].C, e.equity(cs[i].C), e.MaxDD*100)
 				if heartbeat {
-					e.notify("📊 close %.2f | equity %.2f | maxDD %.2f%% | position open: %v",
-						cs[i].C, e.equity(cs[i].C), e.MaxDD*100, e.Pos != nil)
+					posStr := "no position, waiting for a signal 📍"
+					if e.Pos != nil {
+						pct := (cs[i].C - e.Pos.Entry) / e.Pos.Entry * 100
+						posStr = fmt.Sprintf("IN TRADE @ %.2f (%+.2f%%)", e.Pos.Entry, pct)
+					}
+					e.notify(fmt.Sprintf("📊 *daily update*\n\ngold price: *%.2f* 🥇\nyour equity: *%.2f USDT*\nmax heat taken: %.2f%%\n\nposition: %s\n\nstill on it 👀", cs[i].C, e.equity(cs[i].C), e.MaxDD*100, posStr))
 				}
 				if err := saveState(statePath, e, last); err != nil {
 					e.logf("state save failed: %v", err)
